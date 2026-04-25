@@ -9,9 +9,19 @@ const PORT = process.env.PORT || 3001;
 app.use(cors({ origin: process.env.FRONTEND_URL || "*" }));
 app.use(express.json());
 
-// Gemini model to use
-const GEMINI_MODEL = "gemini-1.0-pro";
+// ─── Model fallback list ───────────────────────────────────────────────────────
+// If first model is busy/fails, automatically tries the next one
+const GEMINI_MODELS = [
+  "gemini-flash-latest",     // Primary — fastest
+  "gemini-1.5-flash-latest", // Fallback 1
+  "gemini-1.5-flash",        // Fallback 2
+  "gemini-1.0-pro",          // Fallback 3 — most stable
+];
 
+const MAX_RETRIES = 3;       // Retry each model up to 3 times
+const RETRY_DELAY_MS = 1500; // Wait 1.5s between retries
+
+// ─── System prompt ─────────────────────────────────────────────────────────────
 const defaultSystemPrompt = `You are Hlaed, an advanced multi-step reasoning and planning agent built by Hlaed.
 
 Your identity:
@@ -30,12 +40,58 @@ When given a task or problem:
 
 Always think before you act. For complex tasks, show your reasoning process explicitly using "Step 1:", "Step 2:", etc. Be concise, sharp, and insightful.`;
 
-// Health check
+// ─── Helper: sleep ─────────────────────────────────────────────────────────────
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+// ─── Helper: call Gemini with one specific model ───────────────────────────────
+async function callGemini(model, geminiContents, system) {
+  const geminiUrl = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${process.env.GEMINI_API_KEY}`;
+
+  const geminiBody = {
+    system_instruction: { parts: [{ text: system }] },
+    contents: geminiContents,
+    generationConfig: {
+      maxOutputTokens: 1000,
+      temperature: 0.7,
+    },
+  };
+
+  const response = await fetch(geminiUrl, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(geminiBody),
+  });
+
+  const data = await response.json();
+  return { response, data };
+}
+
+// ─── Helper: is error retryable? ──────────────────────────────────────────────
+function isRetryable(status, data) {
+  // 429 = rate limit / quota exceeded / high demand
+  // 503 = service unavailable
+  // 500 = internal server error (sometimes temporary)
+  const retryableCodes = [429, 503, 500];
+  if (retryableCodes.includes(status)) return true;
+
+  const msg = data?.error?.message || "";
+  if (msg.includes("high demand")) return true;
+  if (msg.includes("quota")) return true;
+  if (msg.includes("rate limit")) return true;
+  if (msg.includes("Resource exhausted")) return true;
+  return false;
+}
+
+// ─── Health check ──────────────────────────────────────────────────────────────
 app.get("/", (req, res) => {
-  res.json({ status: "Hlaed backend running ✅ (powered by Gemini)" });
+  res.json({
+    status: "Hlaed backend running ✅",
+    models: GEMINI_MODELS,
+    retries: MAX_RETRIES,
+  });
 });
 
-// Chat endpoint — API key stays here, never exposed to browser
+// ─── Chat endpoint ─────────────────────────────────────────────────────────────
 app.post("/api/chat", async (req, res) => {
   const { messages, systemPrompt } = req.body;
 
@@ -45,58 +101,69 @@ app.post("/api/chat", async (req, res) => {
 
   const system = systemPrompt || defaultSystemPrompt;
 
-  try {
-    // Convert messages from {role, content} format to Gemini format
-    // Gemini uses "user" and "model" roles (not "assistant")
-    const geminiContents = messages.map((msg) => ({
-      role: msg.role === "assistant" ? "model" : "user",
-      parts: [{ text: msg.content }],
-    }));
+  // Convert to Gemini format (uses "model" instead of "assistant")
+  const geminiContents = messages.map((msg) => ({
+    role: msg.role === "assistant" ? "model" : "user",
+    parts: [{ text: msg.content }],
+  }));
 
-    const geminiBody = {
-      system_instruction: {
-        parts: [{ text: system }],
-      },
-      contents: geminiContents,
-      generationConfig: {
-        maxOutputTokens: 1000,
-        temperature: 0.7,
-      },
-    };
+  let lastError = null;
 
-    const geminiUrl = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${process.env.GEMINI_API_KEY}`;
+  // ── Try each model in the fallback list ──────────────────────────────────────
+  for (const model of GEMINI_MODELS) {
+    // ── Retry the same model up to MAX_RETRIES times ────────────────────────
+    for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+      try {
+        console.log(`🔄 Trying model: ${model} | Attempt: ${attempt}/${MAX_RETRIES}`);
 
-    const response = await fetch(geminiUrl, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(geminiBody),
-    });
+        const { response, data } = await callGemini(model, geminiContents, system);
 
-    const data = await response.json();
+        // ✅ Success
+        if (response.ok) {
+          const text =
+            data.candidates?.[0]?.content?.parts?.[0]?.text ||
+            "No response generated.";
 
-    if (!response.ok) {
-      console.error("Gemini API error:", data);
-      return res.status(response.status).json({
-        error: data.error?.message || "Gemini API error",
-      });
+          console.log(`✅ Success with model: ${model} on attempt ${attempt}`);
+          return res.json({ content: [{ type: "text", text }] });
+        }
+
+        // ❌ Non-retryable error (e.g. bad request, invalid key)
+        if (!isRetryable(response.status, data)) {
+          console.error(`❌ Non-retryable error on model ${model}:`, data?.error?.message);
+          lastError = data?.error?.message || "API error";
+          break; // Skip retries, try next model
+        }
+
+        // ⏳ Retryable error — wait and retry
+        console.warn(`⚠️ Model ${model} busy (attempt ${attempt}). Retrying in ${RETRY_DELAY_MS}ms...`);
+        lastError = data?.error?.message || "High demand error";
+
+        if (attempt < MAX_RETRIES) {
+          await sleep(RETRY_DELAY_MS * attempt); // Progressive delay: 1.5s, 3s, 4.5s
+        }
+
+      } catch (err) {
+        // Network error — retry
+        console.error(`🔥 Network error on model ${model} attempt ${attempt}:`, err.message);
+        lastError = "Network error";
+        if (attempt < MAX_RETRIES) await sleep(RETRY_DELAY_MS);
+      }
     }
 
-    // Extract text from Gemini response
-    const text =
-      data.candidates?.[0]?.content?.parts?.[0]?.text || "No response generated.";
-
-    // Return in a format the frontend understands
-    res.json({
-      content: [{ type: "text", text }],
-    });
-
-  } catch (err) {
-    console.error("Server error:", err);
-    res.status(500).json({ error: "Internal server error" });
+    console.warn(`⏭️ All retries exhausted for model: ${model}. Trying next fallback...`);
   }
+
+  // All models and retries failed
+  console.error("💀 All models and retries failed. Last error:", lastError);
+  return res.status(503).json({
+    error: "Hlaed is experiencing very high demand right now. Please try again in a moment.",
+  });
 });
 
 app.listen(PORT, () => {
   console.log(`🚀 Hlaed backend running on port ${PORT}`);
-  console.log(`🤖 Using Gemini model: ${GEMINI_MODEL}`);
+  console.log(`🤖 Primary model: ${GEMINI_MODELS[0]}`);
+  console.log(`🔁 Fallback models: ${GEMINI_MODELS.slice(1).join(", ")}`);
+  console.log(`🔄 Max retries per model: ${MAX_RETRIES}`);
 });
