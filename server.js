@@ -10,7 +10,7 @@ app.use(cors({ origin: process.env.FRONTEND_URL || "*" }));
 app.use(express.json());
 
 // Gemini model to use
-const GEMINI_MODEL = "gemini-1.5-flash-latest";
+const GEMINI_MODEL = "gemini-1.0-pro";
 
 const defaultSystemPrompt = `You are Hlaed, an advanced multi-step reasoning and planning agent built by Hlaed.
 
