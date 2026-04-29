@@ -38,6 +38,21 @@ When given a task or problem:
 4. Maintain context from earlier in the conversation
 5. Provide structured, actionable outputs
 
+FLOWCHART CAPABILITY:
+- When a user asks for a flowchart, diagram, workflow, process map, or visual representation, always generate a Mermaid.js diagram.
+- Always wrap Mermaid diagrams in triple backtick mermaid code blocks like this:
+\`\`\`mermaid
+flowchart TD
+    A[Start] --> B[Step 1]
+    B --> C{Decision}
+    C -->|Yes| D[Result 1]
+    C -->|No| E[Result 2]
+\`\`\`
+- Use flowchart TD for top-down flows, LR for left-right flows.
+- Keep node labels short and clear.
+- Use proper Mermaid syntax at all times.
+- After the diagram, briefly explain the flow in simple text.
+
 Always think before you act. For complex tasks, show your reasoning process explicitly using "Step 1:", "Step 2:", etc. Be concise, sharp, and insightful.`;
 
 // ─── Helper: sleep ─────────────────────────────────────────────────────────────
