@@ -9,38 +9,47 @@ const PORT = process.env.PORT || 3001;
 app.use(cors({ origin: process.env.FRONTEND_URL || "*" }));
 app.use(express.json());
 
-// ─── Model fallback list ───────────────────────────────────────────────────────
-// If first model is busy/fails, automatically tries the next one
+// ─── Gemini model fallback list ────────────────────────────────────────────────
 const GEMINI_MODELS = [
-  "gemini-flash-latest",     // Primary — fastest
-  "gemini-1.5-flash-latest", // Fallback 1
-  "gemini-1.5-flash",        // Fallback 2
-  "gemini-1.0-pro",          // Fallback 3 — most stable
+  "gemini-flash-latest",
+  "gemini-1.5-flash-latest",
+  "gemini-1.5-flash",
+  "gemini-1.0-pro",
 ];
-
-const MAX_RETRIES = 3;       // Retry each model up to 3 times
-const RETRY_DELAY_MS = 1500; // Wait 1.5s between retries
+const MAX_RETRIES = 3;
+const RETRY_DELAY_MS = 1500;
 
 // ─── System prompt ─────────────────────────────────────────────────────────────
-const defaultSystemPrompt = `You are Hlaed, an advanced multi-step reasoning and planning agent built by Hlaed.
+const defaultSystemPrompt = `You are Hlaed, a professional AI research and reasoning agent built by Hlaed — an Indian company pioneering the future of AI, cybersecurity, and cutting-edge IT solutions.
 
-Your identity:
+IDENTITY:
 - Your name is Hlaed. That is your only name.
-- You were created by Hlaed, an Indian company pioneering the future of AI, cybersecurity, and cutting-edge IT solutions.
-- You are not built on any other AI, and you do not reference any other AI system, company, or technology behind you.
-- If anyone asks who made you, what you are built on, or what technology powers you, simply say: "I am Hlaed, an AI agent proudly built by Hlaed — an Indian company pioneering the future of AI, cybersecurity, and cutting-edge IT solutions."
-- Never mention Claude, Anthropic, GPT, OpenAI, Gemini, Google, or any other AI company or model — not even to deny using them. Never confuse yourself (the AI agent) with Hlaed the company — both share the name but you are the agent, and Hlaed is also the company that built you.
+- You were created by Hlaed company.
+- Never mention Claude, Anthropic, GPT, OpenAI, Gemini, Google, Tavily, or any other AI/search company or model.
+- If asked who made you: "I am Hlaed, an AI agent proudly built by Hlaed — an Indian company pioneering the future of AI, cybersecurity, and cutting-edge IT solutions."
 
-When given a task or problem:
-1. Break it down into clear, logical steps
-2. Reason through each step carefully
-3. Ask clarifying questions when needed
-4. Maintain context from earlier in the conversation
-5. Provide structured, actionable outputs
+YOUR USERS:
+- Researchers, business professionals, entrepreneurs, scientists, and experts.
+- They expect professional, accurate, well-structured, and cited answers.
+- Never give vague or generic answers — always be specific, data-driven, and factual.
+
+RESPONSE STYLE — adapt based on how user asks:
+- If user asks casually → give a clear, direct best answer with sources at the bottom
+- If user asks for a summary → summarize key findings, then list sources
+- If user asks for research/deep analysis → give detailed structured answer with inline citations [1][2] and full source list
+- If user asks for latest news → present as news briefing with headlines and sources
+- If user asks for comparison → use structured comparison with data points and sources
+- Always end professional research answers with a "Sources:" section
+
+WEB SEARCH DATA:
+- When web search results are provided to you, use them as your PRIMARY source of truth.
+- Always cite sources. Format: [1] Source Title — URL
+- Clearly distinguish between what you found from search vs your own knowledge.
+- If search results are provided, prioritize them over your training data for current facts.
+- Never fabricate URLs or sources. Only cite what was actually found in search results.
 
 FLOWCHART CAPABILITY:
-- When a user asks for a flowchart, diagram, workflow, process map, or visual representation, always generate a Mermaid.js diagram.
-- Always wrap Mermaid diagrams in triple backtick mermaid code blocks like this:
+- When asked for flowchart, diagram, workflow, or process map, generate Mermaid.js:
 \`\`\`mermaid
 flowchart TD
     A[Start] --> B[Step 1]
@@ -48,65 +57,164 @@ flowchart TD
     C -->|Yes| D[Result 1]
     C -->|No| E[Result 2]
 \`\`\`
-- Use flowchart TD for top-down flows, LR for left-right flows.
-- Keep node labels short and clear.
-- Use proper Mermaid syntax at all times.
-- After the diagram, briefly explain the flow in simple text.
+- Use TD for top-down, LR for left-right.
+- After the diagram, briefly explain the flow.
 
-Always think before you act. For complex tasks, show your reasoning process explicitly using "Step 1:", "Step 2:", etc. Be concise, sharp, and insightful.`;
+REASONING:
+- Break complex problems into clear steps.
+- For multi-step tasks use "Step 1:", "Step 2:", etc.
+- Be concise, sharp, professional, and insightful.`;
 
-// ─── Helper: sleep ─────────────────────────────────────────────────────────────
-const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+// ─── Search trigger keywords ───────────────────────────────────────────────────
+const SEARCH_TRIGGER_KEYWORDS = [
+  "latest","recent","current","today","now","2024","2025","2026","news","update","trend",
+  "research","study","report","statistics","data","survey","analysis","findings","evidence",
+  "market","price","stock","revenue","funding","startup","company","industry","competitor",
+  "investment","ipo","valuation","growth rate","market share","gdp","inflation",
+  "discovered","breakthrough","launched","released","announced","new version","patent",
+  "who is","what is the","how many","when did","where is","which country","best in",
+  "top 10","list of","examples of","case study","compare","vs","versus",
+  "regulation","law","policy","government","tax","compliance","standard","certification",
+];
 
-// ─── Helper: call Gemini with one specific model ───────────────────────────────
-async function callGemini(model, geminiContents, system) {
-  const geminiUrl = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${process.env.GEMINI_API_KEY}`;
+// ─── Helpers ───────────────────────────────────────────────────────────────────
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
-  const geminiBody = {
-    system_instruction: { parts: [{ text: system }] },
-    contents: geminiContents,
-    generationConfig: {
-      maxOutputTokens: 1000,
-      temperature: 0.7,
-    },
-  };
-
-  const response = await fetch(geminiUrl, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(geminiBody),
-  });
-
-  const data = await response.json();
-  return { response, data };
+function needsWebSearch(messages) {
+  const last = [...messages].reverse().find(m => m.role === "user");
+  if (!last) return false;
+  const text = last.content.toLowerCase();
+  if (["search","look up","find me","what's happening","browse"].some(k => text.includes(k))) return true;
+  return SEARCH_TRIGGER_KEYWORDS.some(kw => text.includes(kw));
 }
 
-// ─── Helper: is error retryable? ──────────────────────────────────────────────
-function isRetryable(status, data) {
-  // 429 = rate limit / quota exceeded / high demand
-  // 503 = service unavailable
-  // 500 = internal server error (sometimes temporary)
-  const retryableCodes = [429, 503, 500];
-  if (retryableCodes.includes(status)) return true;
+function extractSearchQuery(messages) {
+  const last = [...messages].reverse().find(m => m.role === "user");
+  return last ? last.content : "";
+}
 
+function isRetryable(status, data) {
+  if ([429, 503, 500].includes(status)) return true;
   const msg = data?.error?.message || "";
-  if (msg.includes("high demand")) return true;
-  if (msg.includes("quota")) return true;
-  if (msg.includes("rate limit")) return true;
-  if (msg.includes("Resource exhausted")) return true;
-  return false;
+  return msg.includes("high demand") || msg.includes("quota") ||
+         msg.includes("rate limit") || msg.includes("Resource exhausted");
+}
+
+// ─── Tavily search ─────────────────────────────────────────────────────────────
+async function tavilySearch(query) {
+  console.log(`🔍 Searching: "${query}"`);
+  const res = await fetch("https://api.tavily.com/search", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      api_key: process.env.TAVILY_API_KEY,
+      query,
+      search_depth: "advanced",
+      include_answer: true,
+      include_raw_content: false,
+      max_results: 6,
+    }),
+  });
+  if (!res.ok) throw new Error(`Tavily failed: ${await res.text()}`);
+  return res.json();
+}
+
+function formatSearchResults(searchData, query) {
+  let ctx = `WEB SEARCH RESULTS FOR: "${query}"\nSearch time: ${new Date().toUTCString()}\n\n`;
+  if (searchData.answer) ctx += `QUICK ANSWER: ${searchData.answer}\n\n`;
+  ctx += `TOP SOURCES:\n`;
+  searchData.results.forEach((r, i) => {
+    ctx += `\n[${i+1}] ${r.title}\nURL: ${r.url}\nContent: ${r.content}\n`;
+  });
+  ctx += `\nINSTRUCTION: Use above as PRIMARY source. Cite with [1][2] etc. End with "Sources:" section.`;
+  return ctx;
+}
+
+// ─── Gemini streaming call ─────────────────────────────────────────────────────
+async function callGeminiStream(model, geminiContents, system, res) {
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:streamGenerateContent?key=${process.env.GEMINI_API_KEY}&alt=sse`;
+
+  const body = {
+    system_instruction: { parts: [{ text: system }] },
+    contents: geminiContents,
+    generationConfig: { maxOutputTokens: 2000, temperature: 0.3 },
+  };
+
+  const geminiRes = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+
+  if (!geminiRes.ok) {
+    const errData = await geminiRes.json();
+    return { success: false, status: geminiRes.status, data: errData };
+  }
+
+  // Stream SSE chunks to client
+  return new Promise((resolve) => {
+    let buffer = "";
+    let fullText = "";
+
+    geminiRes.body.on("data", (chunk) => {
+      buffer += chunk.toString();
+      const lines = buffer.split("\n");
+      buffer = lines.pop(); // keep incomplete line
+
+      for (const line of lines) {
+        if (line.startsWith("data: ")) {
+          const jsonStr = line.slice(6).trim();
+          if (!jsonStr || jsonStr === "[DONE]") continue;
+          try {
+            const parsed = JSON.parse(jsonStr);
+            const text = parsed.candidates?.[0]?.content?.parts?.[0]?.text || "";
+            if (text) {
+              fullText += text;
+              // Send chunk to client as SSE
+              res.write(`data: ${JSON.stringify({ type: "chunk", text })}\n\n`);
+            }
+          } catch (_) {}
+        }
+      }
+    });
+
+    geminiRes.body.on("end", () => {
+      resolve({ success: true, fullText });
+    });
+
+    geminiRes.body.on("error", (err) => {
+      resolve({ success: false, error: err.message });
+    });
+  });
+}
+
+// ─── Gemini non-streaming fallback ────────────────────────────────────────────
+async function callGeminiFallback(model, geminiContents, system) {
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${process.env.GEMINI_API_KEY}`;
+  const body = {
+    system_instruction: { parts: [{ text: system }] },
+    contents: geminiContents,
+    generationConfig: { maxOutputTokens: 2000, temperature: 0.3 },
+  };
+  const response = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  const data = await response.json();
+  return { response, data };
 }
 
 // ─── Health check ──────────────────────────────────────────────────────────────
 app.get("/", (req, res) => {
   res.json({
     status: "Hlaed backend running ✅",
+    features: ["streaming", "tavily-search", "auto-detect", "retry-fallback"],
     models: GEMINI_MODELS,
-    retries: MAX_RETRIES,
   });
 });
 
-// ─── Chat endpoint ─────────────────────────────────────────────────────────────
+// ─── Streaming chat endpoint ───────────────────────────────────────────────────
 app.post("/api/chat", async (req, res) => {
   const { messages, systemPrompt } = req.body;
 
@@ -115,70 +223,117 @@ app.post("/api/chat", async (req, res) => {
   }
 
   const system = systemPrompt || defaultSystemPrompt;
+  let searchPerformed = false;
+  let searchQuery = "";
 
-  // Convert to Gemini format (uses "model" instead of "assistant")
-  const geminiContents = messages.map((msg) => ({
-    role: msg.role === "assistant" ? "model" : "user",
-    parts: [{ text: msg.content }],
-  }));
+  // ── Setup SSE streaming headers ────────────────────────────────────────────
+  res.setHeader("Content-Type", "text/event-stream");
+  res.setHeader("Cache-Control", "no-cache");
+  res.setHeader("Connection", "keep-alive");
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.flushHeaders();
 
-  let lastError = null;
+  try {
+    let augmentedMessages = [...messages];
 
-  // ── Try each model in the fallback list ──────────────────────────────────────
-  for (const model of GEMINI_MODELS) {
-    // ── Retry the same model up to MAX_RETRIES times ────────────────────────
-    for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+    // ── Auto web search ────────────────────────────────────────────────────
+    if (needsWebSearch(messages) && process.env.TAVILY_API_KEY) {
       try {
-        console.log(`🔄 Trying model: ${model} | Attempt: ${attempt}/${MAX_RETRIES}`);
+        searchQuery = extractSearchQuery(messages);
+        // Tell frontend search is happening
+        res.write(`data: ${JSON.stringify({ type: "searching", query: searchQuery })}\n\n`);
 
-        const { response, data } = await callGemini(model, geminiContents, system);
+        const searchData = await tavilySearch(searchQuery);
+        const searchContext = formatSearchResults(searchData, searchQuery);
 
-        // ✅ Success
-        if (response.ok) {
-          const text =
-            data.candidates?.[0]?.content?.parts?.[0]?.text ||
-            "No response generated.";
-
-          console.log(`✅ Success with model: ${model} on attempt ${attempt}`);
-          return res.json({ content: [{ type: "text", text }] });
-        }
-
-        // ❌ Non-retryable error (e.g. bad request, invalid key)
-        if (!isRetryable(response.status, data)) {
-          console.error(`❌ Non-retryable error on model ${model}:`, data?.error?.message);
-          lastError = data?.error?.message || "API error";
-          break; // Skip retries, try next model
-        }
-
-        // ⏳ Retryable error — wait and retry
-        console.warn(`⚠️ Model ${model} busy (attempt ${attempt}). Retrying in ${RETRY_DELAY_MS}ms...`);
-        lastError = data?.error?.message || "High demand error";
-
-        if (attempt < MAX_RETRIES) {
-          await sleep(RETRY_DELAY_MS * attempt); // Progressive delay: 1.5s, 3s, 4.5s
-        }
-
-      } catch (err) {
-        // Network error — retry
-        console.error(`🔥 Network error on model ${model} attempt ${attempt}:`, err.message);
-        lastError = "Network error";
-        if (attempt < MAX_RETRIES) await sleep(RETRY_DELAY_MS);
+        augmentedMessages = [
+          ...messages.slice(0, -1),
+          {
+            role: "user",
+            content: `${searchContext}\n\nUSER QUESTION: ${messages[messages.length-1].content}`,
+          },
+        ];
+        searchPerformed = true;
+        res.write(`data: ${JSON.stringify({ type: "search_done", count: searchData.results.length })}\n\n`);
+        console.log(`✅ Search done — ${searchData.results.length} sources`);
+      } catch (searchErr) {
+        console.warn("⚠️ Search failed:", searchErr.message);
+        res.write(`data: ${JSON.stringify({ type: "search_failed" })}\n\n`);
       }
     }
 
-    console.warn(`⏭️ All retries exhausted for model: ${model}. Trying next fallback...`);
-  }
+    // ── Build Gemini content ───────────────────────────────────────────────
+    const geminiContents = augmentedMessages.map(msg => ({
+      role: msg.role === "assistant" ? "model" : "user",
+      parts: [{ text: msg.content }],
+    }));
 
-  // All models and retries failed
-  console.error("💀 All models and retries failed. Last error:", lastError);
-  return res.status(503).json({
-    error: "Hlaed is experiencing very high demand right now. Please try again in a moment.",
-  });
+    // ── Try streaming with each model ─────────────────────────────────────
+    let success = false;
+    let fullText = "";
+    let lastError = null;
+
+    for (const model of GEMINI_MODELS) {
+      for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+        try {
+          console.log(`🔄 Streaming: ${model} | Attempt ${attempt}`);
+          const result = await callGeminiStream(model, geminiContents, system, res);
+
+          if (result.success) {
+            fullText = result.fullText;
+            success = true;
+            console.log(`✅ Stream success: ${model}`);
+            break;
+          }
+
+          // Non-streaming fallback if streaming endpoint fails
+          if (result.status && !isRetryable(result.status, result.data)) {
+            // Try non-streaming fallback
+            const { response, data } = await callGeminiFallback(model, geminiContents, system);
+            if (response.ok) {
+              fullText = data.candidates?.[0]?.content?.parts?.[0]?.text || "";
+              // Simulate streaming by sending in chunks
+              const words = fullText.split(" ");
+              for (let i = 0; i < words.length; i += 3) {
+                const chunk = words.slice(i, i+3).join(" ") + (i+3 < words.length ? " " : "");
+                res.write(`data: ${JSON.stringify({ type: "chunk", text: chunk })}\n\n`);
+                await sleep(30);
+              }
+              success = true;
+              break;
+            }
+            lastError = data?.error?.message;
+            break;
+          }
+
+          lastError = result.data?.error?.message || result.error || "Stream error";
+          if (attempt < MAX_RETRIES) await sleep(RETRY_DELAY_MS * attempt);
+
+        } catch (err) {
+          lastError = err.message;
+          if (attempt < MAX_RETRIES) await sleep(RETRY_DELAY_MS);
+        }
+      }
+      if (success) break;
+    }
+
+    if (!success) {
+      res.write(`data: ${JSON.stringify({ type: "error", message: "Hlaed is experiencing high demand. Please try again." })}\n\n`);
+    } else {
+      // Signal completion with metadata
+      res.write(`data: ${JSON.stringify({ type: "done", searchPerformed, searchQuery: searchPerformed ? searchQuery : null })}\n\n`);
+    }
+
+  } catch (err) {
+    console.error("💀 Fatal:", err.message);
+    res.write(`data: ${JSON.stringify({ type: "error", message: "Server error. Please try again." })}\n\n`);
+  } finally {
+    res.end();
+  }
 });
 
 app.listen(PORT, () => {
-  console.log(`🚀 Hlaed backend running on port ${PORT}`);
-  console.log(`🤖 Primary model: ${GEMINI_MODELS[0]}`);
-  console.log(`🔁 Fallback models: ${GEMINI_MODELS.slice(1).join(", ")}`);
-  console.log(`🔄 Max retries per model: ${MAX_RETRIES}`);
+  console.log(`🚀 Hlaed backend on port ${PORT}`);
+  console.log(`🔍 Tavily: ${process.env.TAVILY_API_KEY ? "✅ Enabled" : "❌ No key"}`);
+  console.log(`📡 Streaming: ✅ Enabled`);
 });
