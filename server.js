@@ -60,10 +60,16 @@ flowchart TD
 - Use TD for top-down, LR for left-right.
 - After the diagram, briefly explain the flow.
 
+IMAGE GENERATION:
+- Image generation is handled automatically by the system when users request it.
+- If a user asks for an image and you see "I am generating your image now..." in context, simply confirm the image is being created.
+- Do NOT describe images or give visual descriptions when a user asks to generate an image — the system handles this automatically.
+- Never mention Pollinations, Stability AI, or any image service name.
+
 REASONING:
 - Break complex problems into clear steps.
 - For multi-step tasks use "Step 1:", "Step 2:", etc.
-- Be concise, sharp, professional, and insightful.`;
+- Be concise, sharp, professional, and insightful.\`;
 
 // ─── Search trigger keywords ───────────────────────────────────────────────────
 const SEARCH_TRIGGER_KEYWORDS = [
@@ -91,6 +97,56 @@ function needsWebSearch(messages) {
 function extractSearchQuery(messages) {
   const last = [...messages].reverse().find(m => m.role === "user");
   return last ? last.content : "";
+}
+
+// ─── Image generation helpers ──────────────────────────────────────────────────
+const IMAGE_TRIGGER_WORDS = [
+  "generate an image","generate image","create an image","create image",
+  "make an image","make image","draw me","draw a","draw an",
+  "illustrate","create a picture","generate a picture","show me a picture",
+  "create a photo","generate a photo","make a logo","create a logo",
+  "design a logo","generate art","make art","create art","create artwork",
+  "generate artwork","paint a","paint me","sketch a","sketch me",
+  "create a visual","generate a visual","show an image","show a picture",
+];
+
+function isImageRequest(messages) {
+  const last = [...messages].reverse().find(m => m.role === "user");
+  if (!last) return false;
+  const text = last.content.toLowerCase().trim();
+  return IMAGE_TRIGGER_WORDS.some(kw => text.includes(kw));
+}
+
+// Build a clean image prompt directly from user message
+function buildImagePromptFromMessage(messages) {
+  const last = [...messages].reverse().find(m => m.role === "user");
+  if (!last) return "";
+  let text = last.content.trim();
+  // Remove common prefix phrases to get the core subject
+  const prefixes = [
+    "generate an image of","generate image of","create an image of","create image of",
+    "make an image of","make image of","draw me a","draw me an","draw a","draw an",
+    "create a picture of","generate a picture of","show me a picture of",
+    "create a photo of","generate a photo of","make a logo for","create a logo for",
+    "design a logo for","generate art of","make art of","create art of",
+    "paint a","paint me a","sketch a","sketch me a","illustrate",
+    "generate","create","make","draw","show",
+  ];
+  const lower = text.toLowerCase();
+  for (const prefix of prefixes) {
+    if (lower.startsWith(prefix)) {
+      text = text.slice(prefix.length).trim();
+      break;
+    }
+  }
+  // Enhance prompt for better image quality
+  return text + ", high quality, detailed, professional, 8k resolution";
+}
+
+function buildPollinationsUrl(prompt) {
+  const encoded = encodeURIComponent(prompt);
+  const seed = Math.floor(Math.random() * 999999);
+  return `https://image.pollinations.ai/prompt/${encoded}?width=1024&height=1024&seed=${seed}&model=flux&nologo=true&enhance=true`;
 }
 
 function isRetryable(status, data) {
@@ -209,9 +265,30 @@ async function callGeminiFallback(model, geminiContents, system) {
 app.get("/", (req, res) => {
   res.json({
     status: "Hlaed backend running ✅",
-    features: ["streaming", "tavily-search", "auto-detect", "retry-fallback"],
+    features: ["streaming", "tavily-search", "image-generation", "auto-detect", "retry-fallback"],
     models: GEMINI_MODELS,
   });
+});
+
+// ─── Image generation endpoint ─────────────────────────────────────────────────
+app.post("/api/generate-image", async (req, res) => {
+  const { prompt } = req.body;
+  if (!prompt) return res.status(400).json({ error: "Prompt required" });
+
+  try {
+    console.log(`🎨 Generating image: "${prompt.slice(0,60)}..."`);
+    const imageUrl = buildPollinationsUrl(prompt);
+
+    // Verify image is accessible
+    const check = await fetch(imageUrl, { method: "HEAD" });
+    if (!check.ok) throw new Error("Image generation failed");
+
+    console.log("✅ Image generated successfully");
+    res.json({ imageUrl, prompt });
+  } catch (err) {
+    console.error("❌ Image generation error:", err.message);
+    res.status(500).json({ error: "Image generation failed. Please try again." });
+  }
 });
 
 // ─── Streaming chat endpoint ───────────────────────────────────────────────────
@@ -235,6 +312,29 @@ app.post("/api/chat", async (req, res) => {
 
   try {
     let augmentedMessages = [...messages];
+
+    // ── Direct image generation — detect before calling AI ─────────────────
+    if (isImageRequest(messages)) {
+      const imagePrompt = buildImagePromptFromMessage(messages);
+      const imageUrl = buildPollinationsUrl(imagePrompt);
+      console.log(`🎨 Image request detected: "${imagePrompt}"`);
+
+      // Tell frontend image is generating
+      res.write(`data: ${JSON.stringify({ type: "chunk", text: "I am generating your image now..." })}
+
+`);
+      await sleep(300);
+      res.write(`data: ${JSON.stringify({ type: "chunk", text: "\n\nHere is your generated image:" })}
+
+`);
+      res.write(`data: ${JSON.stringify({ type: "generate_image", prompt: imagePrompt, imageUrl })}
+
+`);
+      res.write(`data: ${JSON.stringify({ type: "done", searchPerformed: false, searchQuery: null })}
+
+`);
+      return;
+    }
 
     // ── Auto web search ────────────────────────────────────────────────────
     if (needsWebSearch(messages) && process.env.TAVILY_API_KEY) {
@@ -320,6 +420,12 @@ app.post("/api/chat", async (req, res) => {
     if (!success) {
       res.write(`data: ${JSON.stringify({ type: "error", message: "Hlaed is experiencing high demand. Please try again." })}\n\n`);
     } else {
+      // Check if response contains image generation tag
+      const imagePrompt = extractImagePrompt(fullText);
+      if (imagePrompt) {
+        // Tell frontend to generate image
+        res.write(`data: ${JSON.stringify({ type: "generate_image", prompt: imagePrompt })}\n\n`);
+      }
       // Signal completion with metadata
       res.write(`data: ${JSON.stringify({ type: "done", searchPerformed, searchQuery: searchPerformed ? searchQuery : null })}\n\n`);
     }
@@ -336,4 +442,5 @@ app.listen(PORT, () => {
   console.log(`🚀 Hlaed backend on port ${PORT}`);
   console.log(`🔍 Tavily: ${process.env.TAVILY_API_KEY ? "✅ Enabled" : "❌ No key"}`);
   console.log(`📡 Streaming: ✅ Enabled`);
+  console.log(`🎨 Image Generation: ✅ Pollinations AI (Free)`);
 });
