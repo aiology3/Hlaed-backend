@@ -69,7 +69,7 @@ IMAGE GENERATION:
 REASONING:
 - Break complex problems into clear steps.
 - For multi-step tasks use "Step 1:", "Step 2:", etc.
-- Be concise, sharp, professional, and insightful.\`;
+- Be concise, sharp, professional, and insightful.`;
 
 // ─── Search trigger keywords ───────────────────────────────────────────────────
 const SEARCH_TRIGGER_KEYWORDS = [
