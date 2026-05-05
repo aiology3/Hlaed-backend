@@ -6,8 +6,63 @@ require("dotenv").config();
 const app = express();
 const PORT = process.env.PORT || 3001;
 
-app.use(cors({ origin: process.env.FRONTEND_URL || "*" }));
-app.use(express.json());
+// ─── CORS ─────────────────────────────────────────────────────────────────────
+const allowedOrigins = process.env.FRONTEND_URL
+  ? [process.env.FRONTEND_URL]
+  : ["http://localhost:3000"];
+
+app.use(cors({
+  origin: (origin, cb) => {
+    if (!origin || allowedOrigins.some(o => origin.startsWith(o))) cb(null, true);
+    else cb(new Error("Not allowed by CORS"));
+  },
+  methods: ["POST", "GET"],
+  allowedHeaders: ["Content-Type"],
+}));
+
+// ─── Security headers ─────────────────────────────────────────────────────────
+app.use((req, res, next) => {
+  res.setHeader("X-Content-Type-Options", "nosniff");
+  res.setHeader("X-Frame-Options", "DENY");
+  res.setHeader("X-XSS-Protection", "1; mode=block");
+  res.setHeader("Referrer-Policy", "no-referrer");
+  res.setHeader("Permissions-Policy", "camera=(), microphone=(), geolocation=()");
+  res.setHeader("Content-Security-Policy",
+    "default-src 'self'; script-src 'none'; object-src 'none'");
+  next();
+});
+
+// ─── Rate limiting — prevent abuse ────────────────────────────────────────────
+const rateLimitMap = new Map();
+app.use("/api/", (req, res, next) => {
+  const ip = req.headers["x-forwarded-for"]?.split(",")[0] || req.socket.remoteAddress;
+  const now = Date.now();
+  const windowMs = 60 * 1000; // 1 minute
+  const maxRequests = 30; // max 30 requests per minute per IP
+
+  if (!rateLimitMap.has(ip)) rateLimitMap.set(ip, []);
+  const timestamps = rateLimitMap.get(ip).filter(t => now - t < windowMs);
+  timestamps.push(now);
+  rateLimitMap.set(ip, timestamps);
+
+  if (timestamps.length > maxRequests) {
+    return res.status(429).json({ error: "Too many requests. Please slow down." });
+  }
+  next();
+});
+
+// ─── Input validation ─────────────────────────────────────────────────────────
+function sanitizeMessages(messages) {
+  return messages
+    .filter(m => m && typeof m.role === "string" && typeof m.content === "string")
+    .map(m => ({
+      role: ["user","assistant"].includes(m.role) ? m.role : "user",
+      content: m.content.slice(0, 8000), // max 8000 chars per message
+    }))
+    .slice(-20); // keep last 20 messages only
+}
+
+app.use(express.json({ limit: "1mb" }));
 
 // ─── Gemini model fallback list ────────────────────────────────────────────────
 const GEMINI_MODELS = [
@@ -293,11 +348,14 @@ app.post("/api/generate-image", async (req, res) => {
 
 // ─── Streaming chat endpoint ───────────────────────────────────────────────────
 app.post("/api/chat", async (req, res) => {
-  const { messages, systemPrompt } = req.body;
+  let { messages, systemPrompt } = req.body;
 
-  if (!messages || !Array.isArray(messages)) {
+  if (!messages || !Array.isArray(messages) || messages.length === 0) {
     return res.status(400).json({ error: "Invalid messages format" });
   }
+  const sanitized = sanitizeMessages(messages);
+  if (!sanitized.length) return res.status(400).json({ error: "No valid messages" });
+  messages = sanitized;
 
   const system = systemPrompt || defaultSystemPrompt;
   let searchPerformed = false;
